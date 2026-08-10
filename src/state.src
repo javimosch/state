@@ -243,6 +243,146 @@ func status_exit_code(status) (code) {
 	if status == "CRITICAL" { code = 2 }
 }
 
+// ---- `state update` (cli-update-spec v1.1, update core only) ----
+
+func strip_quotes(s) (out) {
+	out = s
+	if len(s) >= 2 {
+		if substr(s, 0, 1) == "\"" && substr(s, len(s)-1, len(s)) == "\"" { out = substr(s, 1, len(s)-1) }
+	}
+}
+
+func shell_quote(s) (q) {
+	q = "'" + replace(s, "'", "'\\''") + "'"
+}
+
+func is_hex12(s) (ok) {
+	ok = true
+	if len(s) != 12 { ok = false  return }
+	digits := "0123456789abcdef"
+	i := 0
+	for i < len(s) {
+		if index(digits, substr(s, i, i+1)) < 0 { ok = false  return }
+		i = i + 1
+	}
+}
+
+func state_self_path() (p) {
+	p = args()[0]
+	if contains(p, "/") == false {
+		code, out, _ := exec("command -v " + shell_quote(p))
+		if code == 0 && trim(out) != "" { p = trim(out) }
+	}
+	code2, out2, _ := exec("readlink -f " + shell_quote(p))
+	if code2 == 0 && trim(out2) != "" { p = trim(out2) }
+}
+
+func update_origin(url) (base) {
+	base = ""
+	i := index(url, "://")
+	if i < 0 { return }
+	start := i + 3
+	tail := substr(url, start, len(url))
+	slash := index(tail, "/")
+	if slash < 0 { base = url } else { base = substr(url, 0, start + slash) }
+}
+
+func update_download_url(manifest_url, download) (url) {
+	url = download
+	if has_prefix(url, "http://") || has_prefix(url, "https://") { return }
+	base := env("STATE_UPDATE_BASE")
+	if base == "" { base = update_origin(manifest_url) }
+	if base == "" { return "" }
+	if has_suffix(base, "/") { base = substr(base, 0, len(base)-1) }
+	if has_prefix(url, "/") { url = base + url } else { url = base + "/" + url }
+}
+
+func update_manifest(url) (body) {
+	code, out, err := exec("curl -fsSL --max-time 10 " + shell_quote(url))
+	if code != 0 { fail(100, "update_manifest_unreachable", "could not fetch update manifest: " + trim(err), "check STATE_UPDATE_URL and network access") }
+	body = trim(out)
+	if body == "" { fail(100, "update_manifest_empty", "update manifest was empty", "publish a valid update manifest") }
+}
+
+func cmd_update(a) {
+	check_only := false
+	force := false
+	i := 2
+	for i < len(a) {
+		if a[i] == "--check" { check_only = true }
+		if a[i] == "--force" { force = true }
+		if a[i] != "--check" && a[i] != "--force" { fail(80, "invalid_arguments", "usage: state update [--check|--force]", "state help-json") }
+		i = i + 1
+	}
+	if check_only && force { fail(80, "invalid_arguments", "--check and --force cannot be combined", "state update --check or state update --force") }
+	manifest_url := env("STATE_UPDATE_URL")
+	if manifest_url == "" { fail(90, "update_url_missing", "STATE_UPDATE_URL is required for state update", "export STATE_UPDATE_URL=https://host/version") }
+	self := state_self_path()
+	k, _, _ := stat(self)
+	if k != 1 { fail(100, "self_binary_missing", "could not locate the running state binary: " + self, "run state from an executable path") }
+	local_full := to_hex(sha256_bytes(read_file_bytes(self)))
+	local_ver := substr(local_full, 0, 12)
+	manifest := update_manifest(manifest_url)
+	manifest_ok, manifest_ok_err := json_get(manifest, ".ok")
+	if manifest_ok_err != "" || manifest_ok != "true" { fail(100, "update_manifest_invalid", "update manifest is not marked ok", "publish a manifest with ok=true and version=sha256[:12]") }
+	remote_raw, remote_err := json_get(manifest, ".version")
+	if remote_err != "" { fail(100, "update_manifest_invalid", "update manifest has no version", "publish version as sha256[:12]") }
+	remote_ver := strip_quotes(remote_raw)
+	if is_hex12(remote_ver) == false { fail(100, "update_manifest_invalid", "update manifest version must be 12 lowercase hex characters", "publish sha256[:12] as version") }
+	download_raw, download_err := json_get(manifest, ".download")
+	if download_err != "" { fail(100, "update_manifest_invalid", "update manifest has no download URL", "publish a download path") }
+	download := strip_quotes(download_raw)
+	full_raw, _ := json_get(manifest, ".sha256")
+	remote_full := strip_quotes(full_raw)
+	if local_ver == remote_ver && force == false {
+		println("{\"ok\":true,\"updated\":false,\"up_to_date\":true,\"version\":\"" + local_ver + "\"}")
+		return
+	}
+	if check_only {
+		println("{\"ok\":true,\"updated\":false,\"up_to_date\":false,\"local\":\"" + local_ver + "\",\"remote\":\"" + remote_ver + "\"}")
+		exit(5)
+	}
+	download_url := update_download_url(manifest_url, download)
+	if download_url == "" { fail(100, "update_download_invalid", "could not resolve update download URL", "set STATE_UPDATE_BASE for relative download paths") }
+	tmp := self + ".new-" + to_hex(rand_bytes(4))
+	write(2, "[update] " + local_ver + " -> " + remote_ver + "; downloading candidate\n")
+	if system("curl -fsSL --max-time 120 " + shell_quote(download_url) + " -o " + shell_quote(tmp)) != 0 {
+		remove(tmp)
+		fail(100, "update_download_failed", "could not download update candidate", "retry when the artifact is reachable")
+	}
+	got_full := to_hex(sha256_bytes(read_file_bytes(tmp)))
+	got_ver := substr(got_full, 0, 12)
+	if got_ver != remote_ver || (remote_full != "" && got_full != remote_full) {
+		remove(tmp)
+		fail(100, "update_hash_mismatch", "downloaded candidate hash does not match the manifest", "retry; the published artifact may be incomplete")
+	}
+	if system("chmod +x " + shell_quote(tmp)) != 0 {
+		remove(tmp)
+		fail(100, "update_candidate_not_executable", "could not make update candidate executable", "check permissions on the state directory")
+	}
+	code, out, _ := exec(shell_quote(tmp) + " version 2>/dev/null")
+	// `version` is the stable probe for state: it must produce a version object
+	// before the candidate can replace the running binary.
+	probe_ok, probe_ok_err := json_get(out, ".ok")
+	probe_tool, probe_tool_err := json_get(out, ".tool")
+	probe_ver, probe_ver_err := json_get(out, ".version")
+	if code != 0 || probe_ok_err != "" || probe_ok != "true" || probe_tool_err != "" || strip_quotes(probe_tool) != "state" || probe_ver_err != "" || strip_quotes(probe_ver) == "" {
+		remove(tmp)
+		fail(100, "update_smoke_failed", "downloaded candidate did not pass its health probe", "keep the current binary and inspect the published artifact")
+	}
+	bak := self + ".bak-" + remote_ver + "-" + to_hex(rand_bytes(4))
+	if system("mv " + shell_quote(self) + " " + shell_quote(bak)) != 0 {
+		remove(tmp)
+		fail(100, "update_backup_failed", "could not create the update backup", "check permissions on the state binary directory")
+	}
+	if system("mv " + shell_quote(tmp) + " " + shell_quote(self)) != 0 {
+		system("mv " + shell_quote(bak) + " " + shell_quote(self))
+		remove(tmp)
+		fail(100, "update_swap_failed", "could not install update; previous binary restored", "retry the update")
+	}
+	println("{\"ok\":true,\"updated\":true,\"from\":\"" + local_ver + "\",\"to\":\"" + remote_ver + "\",\"backup\":\"" + bak + "\"}")
+}
+
 // ---- `state config` subcommand ----
 
 func cmd_config(a) {
@@ -320,6 +460,7 @@ func guide_json() (g) {
 	g = g + "\"commands\":{"
 	g = g + "\"report\":[\"state\",\"state --json\"],"
 	g = g + "\"config\":[\"state config\",\"state config get [--json]\",\"state config set --cpu-warn N --cpu-crit N --ram-warn N --ram-crit N --disk-warn N --disk-crit N --disk-path PATH\",\"state config reset\"],"
+	g = g + "\"update\":[\"state update\",\"state update --check\",\"state update --force\"],"
 	g = g + "\"introspection\":[\"state guide\",\"state guide --human\",\"state help-json\",\"state --help\"]"
 	g = g + "},"
 	g = g + "\"examples\":["
@@ -331,7 +472,8 @@ func guide_json() (g) {
 	g = g + "\"cpu_pct is load-based, not an instantaneous CPU sample -- a short spike may not show, and a load average just after boot can lag reality\","
 	g = g + "\"exit codes for the default report are nagios-style (0/1/2), not the cli-output-spec 80-119 error ranges -- errors (bad args, missing /proc) DO use 80-119\","
 	g = g + "\"config is per-user (~/.config/state/config.json), not per-machine -- root and a regular user have independent thresholds\","
-	g = g + "\"disk-path must exist and be a directory; state config set validates it before saving\""
+	g = g + "\"disk-path must exist and be a directory; state config set validates it before saving\","
+	g = g + "\"update uses the running binary sha256[:12] as its identity; it requires STATE_UPDATE_URL and keeps a .bak hash backup after success\""
 	g = g + "],"
 	g = g + "\"version\":\"" + version + "\","
 	g = g + "\"see_also\":[\"state --help\",\"state help-json\"]"
@@ -351,12 +493,14 @@ func guide_human() (h) {
 	h = h + "## Commands\n\n"
 	h = h + "- `state` / `state --json` -- the report\n"
 	h = h + "- `state config [get|set|reset]` -- manage thresholds\n"
+	h = h + "- `state update [--check|--force]` -- verify, smoke-test and atomically install a content-hash update\n"
 	h = h + "- `state guide [--human]` -- this guide\n"
 	h = h + "- `state help-json` -- machine-readable command catalog\n\n"
 	h = h + "## Gotchas\n\n"
 	h = h + "- CPU% is load-based, not an instant sample\n"
 	h = h + "- Report exit codes are nagios-style: 0=OK, 1=CAUTIOUS, 2=CRITICAL\n"
-	h = h + "- Config is per-user, not per-machine\n\n"
+	h = h + "- Config is per-user, not per-machine\n"
+	h = h + "- Update identity is the running binary sha256[:12]; set STATE_UPDATE_URL to a JSON manifest\n\n"
 	h = h + "Version: " + version + "\n"
 }
 
@@ -383,6 +527,8 @@ func cmd_help_json() {
 	h = h + "\"commands\":{"
 	h = h + "\"report\":{\"args\":[],\"flags\":[\"--json\",\"--no-interactive\",\"--yes\",\"--no-color\"],\"auth\":false},"
 	h = h + "\"config\":{\"args\":[\"[get|set|reset]\"],\"flags\":[\"--cpu-warn N\",\"--cpu-crit N\",\"--ram-warn N\",\"--ram-crit N\",\"--disk-warn N\",\"--disk-crit N\",\"--disk-path PATH\"],\"auth\":false},"
+	h = h + "\"update\":{\"args\":[],\"flags\":[\"--check\",\"--force\"],\"auth\":false},"
+	h = h + "\"version\":{\"args\":[],\"flags\":[],\"auth\":false},"
 	h = h + "\"guide\":{\"args\":[],\"flags\":[\"--human\"],\"auth\":false},"
 	h = h + "\"help-json\":{\"args\":[],\"flags\":[],\"auth\":false}"
 	h = h + "},"
@@ -392,9 +538,10 @@ func cmd_help_json() {
 	h = h + "\"2\":\"report only: CRITICAL (nagios-style, not a cli-output-spec range)\","
 	h = h + "\"80\":\"invalid arguments / usage error\","
 	h = h + "\"85\":\"invalid argument value (bad threshold)\","
-	h = h + "\"92\":\"resource not found (disk path)\""
+	h = h + "\"92\":\"resource not found (disk path)\","
+	h = h + "\"100\":\"update download, verification, smoke-test, or swap failure\""
 	h = h + "},"
-	h = h + "\"env\":[\"HOME\"],"
+	h = h + "\"env\":[\"HOME\",\"STATE_UPDATE_URL\",\"STATE_UPDATE_BASE\"],"
 	h = h + "\"see_also\":[\"state guide\",\"state --help\"]"
 	h = h + "}"
 	println(h)
@@ -405,6 +552,7 @@ func print_help() {
 	println("")
 	println("usage: state [--json]")
 	println("       state config [get|set|reset] [flags]")
+	println("       state version")
 	println("       state guide [--human]")
 	println("       state help-json")
 	println("       state --help")
@@ -412,6 +560,7 @@ func print_help() {
 	println("options:")
 	println("  --json               machine-readable report (same data as the human report)")
 	println("  --help, -h           this help")
+	println("  version              print the binary version as JSON")
 	println("")
 	println("config set flags:")
 	println("  --cpu-warn N --cpu-crit N     load% thresholds (load1/cores*100), default 70/90")
@@ -428,6 +577,15 @@ func main() {
 
 	if len(a) > 1 && a[1] == "config" {
 		cmd_config(a)
+		return
+	}
+	if len(a) > 1 && a[1] == "update" {
+		cmd_update(a)
+		return
+	}
+	if len(a) > 1 && (a[1] == "version" || a[1] == "--version") {
+		println("{\"ok\":true,\"tool\":\"state\",\"version\":\"" + version + "\"}")
+		exit(0)
 		return
 	}
 	if len(a) > 1 && a[1] == "guide" {

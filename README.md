@@ -41,6 +41,9 @@ state config set --cpu-warn 70 --cpu-crit 90 \
                   --disk-warn 80 --disk-crit 95 \
                   --disk-path /
 state config reset     # restore defaults
+state version          # binary version as JSON
+state update --check   # check the content-hash manifest (exit 5 when newer)
+state update           # verify, smoke-test and atomically install an update
 
 state guide            # embedded agent skill (model/loop/concepts/gotchas)
 state guide --human    # same, as markdown
@@ -73,6 +76,17 @@ what monitoring scripts and agents already expect from a health check:
 Actual tool errors (bad flags, an unreadable disk path, …) use the
 [cli-output-spec](https://github.com/javimosch/cli-output-spec) `80-119`
 ranges instead — see `state help-json`.
+
+## Updates
+
+`state update` follows the content-hash update flow from
+[cli-update-spec](https://github.com/javimosch/cli-update-spec): it hashes the
+running binary, fetches a JSON manifest from `STATE_UPDATE_URL`, verifies the
+candidate's short and optional full SHA-256, runs `state version` before any
+swap, and keeps a `.bak-<hash>` rollback copy after a successful atomic rename.
+Use `--check` for a non-mutating check (`0` up to date, `5` update available),
+or `--force` to repair a matching but suspect binary. Relative `download` paths
+resolve against `STATE_UPDATE_BASE` when set, otherwise the manifest URL origin.
 
 ## Agent-first
 
