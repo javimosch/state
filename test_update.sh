@@ -73,7 +73,7 @@ printf '%s\n' '{"ok":true,"version":"'"$candidate_ver"'","download":"state-new",
 update_out=$($TMP/state update 2>"$TMP/update.err")
 printf '%s\n' "$update_out" | jq -e '.ok == true and .updated == true and .from and .to and .backup' >/dev/null
 ls "$TMP"/state.bak-"$candidate_ver"-* >/dev/null 2>&1
-$TMP/state version | jq -e '.ok == true and .version == "1.0.0"' >/dev/null
+$TMP/state version | jq -e '.ok == true and .version == "1.1.0"' >/dev/null
 # Matching manifest is a no-op and exits 0.
 current_sha=$(sha256sum "$TMP/state" | awk '{print $1}')
 current_ver=$(printf '%s' "$current_sha" | cut -c1-12)
