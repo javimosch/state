@@ -1,0 +1,6 @@
+# build artifacts
+state
+state.mfl
+
+# os
+.DS_Store

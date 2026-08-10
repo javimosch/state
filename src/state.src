@@ -1,0 +1,469 @@
+// state — agent-first system health CLI. Reports OK / CAUTIOUS / CRITICAL
+// based on CPU (load average vs core count), RAM (free -m) and disk (df -h)
+// usage, against configurable thresholds. Non-interactive, JSON-friendly.
+// See `state guide` for the full agent-first mental model.
+
+type Config struct {
+	cpu_warn  int
+	cpu_crit  int
+	ram_warn  int
+	ram_crit  int
+	disk_warn int
+	disk_crit int
+	disk_path string
+}
+
+var version = "1.0.0"
+
+// ---- generic helpers ----
+
+func filter_empty(parts) (out) {
+	out = []string{}
+	for _, p := range parts {
+		if p != "" { out = append(out, p) }
+	}
+}
+
+func fields_of(s) (out) {
+	out = filter_empty(split(trim(s), " "))
+}
+
+// fail emits a typed error (cli-output-spec §3) on stdout and exits with a
+// semantic exit code (§2). code >= 100 -> recoverable (transient);
+// code < 100 -> not recoverable (fix input, don't retry).
+func fail(code, typ, msg, suggestion) {
+	rec := "false"
+	if code >= 100 { rec = "true" }
+	sug := "[]"
+	if suggestion != "" { sug = "[" + json(suggestion) + "]" }
+	body := "{\"ok\":false,\"error\":{\"code\":" + str(code) + ",\"type\":" + json(typ) + ",\"message\":" + json(msg) + ",\"recoverable\":" + rec + ",\"suggestions\":" + sug + "}}"
+	println(body)
+	exit(code)
+}
+
+// ---- config: ~/.config/state/config.json ----
+
+func config_dir() (d) {
+	d = env("HOME") + "/.config/state"
+}
+
+func config_path() (p) {
+	p = config_dir() + "/config.json"
+}
+
+func default_config() (c) {
+	c = Config{cpu_warn: 70, cpu_crit: 90, ram_warn: 75, ram_crit: 90, disk_warn: 80, disk_crit: 95, disk_path: "/"}
+}
+
+func load_config() (c) {
+	p := config_path()
+	k, _, _ := stat(p)
+	if k != 1 {
+		c = default_config()
+		return
+	}
+	txt := read_file(p)
+	c = parse(txt, Config{})
+	if c.disk_path == "" { c.disk_path = "/" }
+	if c.cpu_warn <= 0 { c.cpu_warn = 70 }
+	if c.cpu_crit <= 0 { c.cpu_crit = 90 }
+	if c.ram_warn <= 0 { c.ram_warn = 75 }
+	if c.ram_crit <= 0 { c.ram_crit = 90 }
+	if c.disk_warn <= 0 { c.disk_warn = 80 }
+	if c.disk_crit <= 0 { c.disk_crit = 95 }
+}
+
+func save_config(c) {
+	home := env("HOME")
+	mkdir(home + "/.config")
+	mkdir(config_dir())
+	write_file(config_path(), json(c))
+}
+
+func config_json(c) (s) {
+	s = "{\"ok\":true,\"version\":\"" + version + "\",\"config\":" + json(c) + ",\"path\":\"" + config_path() + "\"}"
+}
+
+// ---- metric collection ----
+
+func nproc_count() (n) {
+	_, out, _ := exec("nproc")
+	n = parse_int(trim(out))
+	if n < 1 { n = 1 }
+}
+
+// loadavg1 extracts the 1-minute load average from `uptime`'s output
+// ("... load average: 2.58, 2.61, 2.18"). /proc/loadavg is not used here:
+// pseudo-files under /proc report size 0 via stat, which read_file relies
+// on, so it comes back empty -- a machin gotcha, not a /proc quirk.
+func loadavg1(uptime_raw) (l) {
+	l = 0.0
+	idx := index(uptime_raw, "load average:")
+	if idx >= 0 {
+		tail := substr(uptime_raw, idx+len("load average:"), len(uptime_raw))
+		parts := split(tail, ",")
+		if len(parts) > 0 { l = parse_float(trim(parts[0])) }
+	}
+}
+
+func mem_line_from(out) (line) {
+	line = ""
+	for _, ln := range split(out, "\n") {
+		if has_prefix(trim(ln), "Mem:") { line = ln }
+	}
+}
+
+func disk_line_from(out) (line) {
+	line = ""
+	n := 0
+	for _, ln := range split(out, "\n") {
+		if trim(ln) != "" {
+			n = n + 1
+			if n == 2 { line = ln }
+		}
+	}
+}
+
+func use_pct_field(fs) (pct) {
+	pct = 0
+	for _, f := range fs {
+		if has_suffix(f, "%") { pct = parse_int(replace(f, "%", "")) }
+	}
+}
+
+// classify maps a percentage against warn/crit thresholds to a status.
+func classify(pct, warn, crit) (status) {
+	status = "OK"
+	if pct >= warn { status = "CAUTIOUS" }
+	if pct >= crit { status = "CRITICAL" }
+}
+
+func rank_of(status) (r) {
+	r = 0
+	if status == "CAUTIOUS" { r = 1 }
+	if status == "CRITICAL" { r = 2 }
+}
+
+func worse(a, b) (s) {
+	s = a
+	if rank_of(b) > rank_of(a) { s = b }
+}
+
+// ---- the report ----
+
+type Report struct {
+	status      string
+	cpu_pct     int
+	cpu_status  string
+	cpu_load1   float
+	cpu_cores   int
+	ram_pct     int
+	ram_status  string
+	ram_total_mb int
+	ram_used_mb  int
+	ram_avail_mb int
+	disk_pct    int
+	disk_status string
+	disk_path   string
+	uptime_raw  string
+	free_h_raw  string
+	df_h_raw    string
+}
+
+func build_report(c) (r) {
+	_, up_out, _ := exec("uptime")
+	up_out = trim(up_out)
+
+	cores := nproc_count()
+	load1 := loadavg1(up_out)
+	cpu_pct := int(round(load1 / float(cores) * 100.0))
+	cpu_status := classify(cpu_pct, c.cpu_warn, c.cpu_crit)
+
+	_, free_m, _ := exec("free -m")
+	_, free_h, _ := exec("free -h")
+	mline := mem_line_from(free_m)
+	mf := fields_of(mline)
+	total_mb := 0
+	used_mb := 0
+	avail_mb := 0
+	if len(mf) >= 4 {
+		total_mb = parse_int(mf[1])
+		used_mb = parse_int(mf[2])
+		avail_mb = parse_int(mf[3])
+	}
+	if len(mf) >= 7 { avail_mb = parse_int(mf[6]) }
+	ram_pct := 0
+	if total_mb > 0 { ram_pct = int(round(float(total_mb-avail_mb) / float(total_mb) * 100.0)) }
+	ram_status := classify(ram_pct, c.ram_warn, c.ram_crit)
+
+	_, df_h, _ := exec("df -h " + c.disk_path)
+	dline := disk_line_from(df_h)
+	df := fields_of(dline)
+	disk_pct := use_pct_field(df)
+	disk_status := classify(disk_pct, c.disk_warn, c.disk_crit)
+
+	overall := worse(worse(cpu_status, ram_status), disk_status)
+
+	r = Report{
+		status: overall,
+		cpu_pct: cpu_pct, cpu_status: cpu_status, cpu_load1: load1, cpu_cores: cores,
+		ram_pct: ram_pct, ram_status: ram_status, ram_total_mb: total_mb, ram_used_mb: used_mb, ram_avail_mb: avail_mb,
+		disk_pct: disk_pct, disk_status: disk_status, disk_path: c.disk_path,
+		uptime_raw: up_out, free_h_raw: trim(free_h), df_h_raw: trim(dline),
+	}
+}
+
+func report_json(r, c) (s) {
+	s = "{\"ok\":true,\"version\":\"" + version + "\",\"status\":" + json(r.status) + ","
+	s = s + "\"cpu\":{\"pct\":" + str(r.cpu_pct) + ",\"status\":" + json(r.cpu_status) + ",\"load1\":" + str(r.cpu_load1) + ",\"cores\":" + str(r.cpu_cores) + "},"
+	s = s + "\"ram\":{\"pct\":" + str(r.ram_pct) + ",\"status\":" + json(r.ram_status) + ",\"total_mb\":" + str(r.ram_total_mb) + ",\"used_mb\":" + str(r.ram_used_mb) + ",\"available_mb\":" + str(r.ram_avail_mb) + "},"
+	s = s + "\"disk\":{\"pct\":" + str(r.disk_pct) + ",\"status\":" + json(r.disk_status) + ",\"path\":" + json(r.disk_path) + ",\"raw\":" + json(r.df_h_raw) + "},"
+	s = s + "\"uptime\":" + json(r.uptime_raw) + ","
+	s = s + "\"thresholds\":" + json(c)
+	s = s + "}"
+}
+
+func bar(status) (b) {
+	b = "[" + status + "]"
+}
+
+func report_human(r) (s) {
+	s = "state: " + r.status + "\n"
+	s = s + "--------------------------------------------------------\n"
+	s = s + "CPU  : " + str(r.cpu_pct) + "%  load " + str(r.cpu_load1) + "/" + str(r.cpu_cores) + " cores  " + bar(r.cpu_status) + "\n"
+	s = s + "RAM  : " + str(r.ram_pct) + "%  used " + str(r.ram_used_mb) + "MB / total " + str(r.ram_total_mb) + "MB  " + bar(r.ram_status) + "\n"
+	s = s + "DISK : " + str(r.disk_pct) + "%  " + r.disk_path + "  " + bar(r.disk_status) + "\n"
+	s = s + "--------------------------------------------------------\n"
+	s = s + r.uptime_raw + "\n"
+}
+
+func status_exit_code(status) (code) {
+	code = 0
+	if status == "CAUTIOUS" { code = 1 }
+	if status == "CRITICAL" { code = 2 }
+}
+
+// ---- `state config` subcommand ----
+
+func cmd_config(a) {
+	sub := ""
+	if len(a) > 2 { sub = a[2] }
+
+	if sub == "" || sub == "get" {
+		c := load_config()
+		println(config_json(c))
+		exit(0)
+	}
+
+	if sub == "reset" {
+		c := default_config()
+		save_config(c)
+		println(config_json(c))
+		exit(0)
+	}
+
+	if sub == "set" {
+		c := load_config()
+		i := 3
+		for i < len(a) {
+			arg := a[i]
+			if arg == "--cpu-warn" { i = i + 1 ; if i < len(a) { c.cpu_warn = parse_int(a[i]) } }
+			if arg == "--cpu-crit" { i = i + 1 ; if i < len(a) { c.cpu_crit = parse_int(a[i]) } }
+			if arg == "--ram-warn" { i = i + 1 ; if i < len(a) { c.ram_warn = parse_int(a[i]) } }
+			if arg == "--ram-crit" { i = i + 1 ; if i < len(a) { c.ram_crit = parse_int(a[i]) } }
+			if arg == "--disk-warn" { i = i + 1 ; if i < len(a) { c.disk_warn = parse_int(a[i]) } }
+			if arg == "--disk-crit" { i = i + 1 ; if i < len(a) { c.disk_crit = parse_int(a[i]) } }
+			if arg == "--disk-path" { i = i + 1 ; if i < len(a) { c.disk_path = a[i] } }
+			i = i + 1
+		}
+		if c.cpu_warn <= 0 || c.cpu_crit <= 0 || c.cpu_warn > c.cpu_crit {
+			fail(85, "invalid_threshold", "cpu-warn must be > 0 and <= cpu-crit", "state config set --cpu-warn 70 --cpu-crit 90")
+		}
+		if c.ram_warn <= 0 || c.ram_crit <= 0 || c.ram_warn > 100 || c.ram_crit > 100 || c.ram_warn > c.ram_crit {
+			fail(85, "invalid_threshold", "ram-warn/ram-crit must be within 1-100 and warn <= crit", "state config set --ram-warn 75 --ram-crit 90")
+		}
+		if c.disk_warn <= 0 || c.disk_crit <= 0 || c.disk_warn > 100 || c.disk_crit > 100 || c.disk_warn > c.disk_crit {
+			fail(85, "invalid_threshold", "disk-warn/disk-crit must be within 1-100 and warn <= crit", "state config set --disk-warn 80 --disk-crit 95")
+		}
+		k, _, _ := stat(c.disk_path)
+		if k != 2 {
+			fail(92, "disk_path_not_found", "disk path not found or not a directory: " + c.disk_path, "check --disk-path")
+		}
+		save_config(c)
+		println(config_json(c))
+		exit(0)
+	}
+
+	fail(80, "invalid_arguments", "usage: state config [get|set|reset] [flags]", "state guide")
+}
+
+// ---- `state guide` subcommand (cli-guide-spec v1.0) ----
+
+func guide_json() (g) {
+	g = "{"
+	g = g + "\"state\":\"agent-first system health CLI (OK / CAUTIOUS / CRITICAL from CPU, RAM, disk usage)\","
+	g = g + "\"one_liner\":\"state reports whether this machine is healthy by comparing load average, memory usage (free -m) and disk usage (df -h) against configurable thresholds, and prints one of OK, CAUTIOUS or CRITICAL. Built for agents driving unattended maintenance loops as much as for humans.\","
+	g = g + "\"model\":{"
+	g = g + "\"sources\":\"CPU: 1-minute load average (parsed from uptime) divided by core count (nproc) times 100 -- a load-based proxy, not an instantaneous sample. RAM: free -m (used = total - available). DISK: df -h <path> Use% column (default path /).\","
+	g = g + "\"thresholds\":\"each metric has a warn and a crit percentage threshold. pct >= warn -> CAUTIOUS; pct >= crit -> CRITICAL; otherwise OK. Overall status is the worst of the three metrics.\","
+	g = g + "\"config\":\"persisted at ~/.config/state/config.json, written by `state config set`. Defaults: cpu 70/90, ram 75/90, disk 80/95, disk path /.\""
+	g = g + "},"
+	g = g + "\"loop\":["
+	g = g + "\"state config set --cpu-warn 70 --cpu-crit 90 --ram-warn 75 --ram-crit 90 --disk-warn 80 --disk-crit 95  # once, or accept defaults\","
+	g = g + "\"state --json  # machine-readable report; branch on .status or the exit code\","
+	g = g + "\"state  # human-friendly report, same data\"],"
+	g = g + "\"concepts\":{"
+	g = g + "\"status\":\"OK | CAUTIOUS | CRITICAL -- the worst of cpu/ram/disk status\","
+	g = g + "\"cpu_pct\":\"load1 / cores * 100, rounded to an int. Can exceed 100 under heavy load.\","
+	g = g + "\"exit_code\":\"the default report command uses a nagios-style exit code: 0=OK, 1=CAUTIOUS, 2=CRITICAL -- NOT the cli-output-spec 80-119 error ranges, which are reserved for actual tool errors (bad flags, unreadable /proc, etc). See help-json.exit_codes.\""
+	g = g + "},"
+	g = g + "\"commands\":{"
+	g = g + "\"report\":[\"state\",\"state --json\"],"
+	g = g + "\"config\":[\"state config\",\"state config get [--json]\",\"state config set --cpu-warn N --cpu-crit N --ram-warn N --ram-crit N --disk-warn N --disk-crit N --disk-path PATH\",\"state config reset\"],"
+	g = g + "\"introspection\":[\"state guide\",\"state guide --human\",\"state help-json\",\"state --help\"]"
+	g = g + "},"
+	g = g + "\"examples\":["
+	g = g + "{\"goal\":\"quick human status check\",\"do\":[\"state\"]},"
+	g = g + "{\"goal\":\"agent polling loop\",\"do\":[\"state --json\",\"# parse .status, or branch on $? (0/1/2)\"]},"
+	g = g + "{\"goal\":\"tighten disk threshold for a small VPS\",\"do\":[\"state config set --disk-warn 70 --disk-crit 85\",\"state config get\"]},"
+	g = g + "{\"goal\":\"watch a non-root mount\",\"do\":[\"state config set --disk-path /data\"]}],"
+	g = g + "\"gotchas\":["
+	g = g + "\"cpu_pct is load-based, not an instantaneous CPU sample -- a short spike may not show, and a load average just after boot can lag reality\","
+	g = g + "\"exit codes for the default report are nagios-style (0/1/2), not the cli-output-spec 80-119 error ranges -- errors (bad args, missing /proc) DO use 80-119\","
+	g = g + "\"config is per-user (~/.config/state/config.json), not per-machine -- root and a regular user have independent thresholds\","
+	g = g + "\"disk-path must exist and be a directory; state config set validates it before saving\""
+	g = g + "],"
+	g = g + "\"version\":\"" + version + "\","
+	g = g + "\"see_also\":[\"state --help\",\"state help-json\"]"
+	g = g + "}"
+}
+
+func guide_human() (h) {
+	h = "# state -- agent-first system health CLI\n\n"
+	h = h + "Reports OK / CAUTIOUS / CRITICAL from CPU load, RAM and disk usage.\n\n"
+	h = h + "## Sources\n\n"
+	h = h + "- CPU: 1-minute load average (from uptime) / nproc * 100\n"
+	h = h + "- RAM: free -m (used = total - available)\n"
+	h = h + "- DISK: df -h <path> Use% column (default /)\n\n"
+	h = h + "## Loop\n\n"
+	h = h + "1. `state config set --cpu-warn 70 --cpu-crit 90 ...` (once, or accept defaults)\n"
+	h = h + "2. `state --json` for agents, `state` for humans\n\n"
+	h = h + "## Commands\n\n"
+	h = h + "- `state` / `state --json` -- the report\n"
+	h = h + "- `state config [get|set|reset]` -- manage thresholds\n"
+	h = h + "- `state guide [--human]` -- this guide\n"
+	h = h + "- `state help-json` -- machine-readable command catalog\n\n"
+	h = h + "## Gotchas\n\n"
+	h = h + "- CPU% is load-based, not an instant sample\n"
+	h = h + "- Report exit codes are nagios-style: 0=OK, 1=CAUTIOUS, 2=CRITICAL\n"
+	h = h + "- Config is per-user, not per-machine\n\n"
+	h = h + "Version: " + version + "\n"
+}
+
+func cmd_guide(a) {
+	want_human := false
+	i := 2
+	for i < len(a) {
+		if a[i] == "--human" { want_human = true }
+		i = i + 1
+	}
+	if want_human {
+		println(guide_human())
+	} else {
+		println(guide_json())
+	}
+}
+
+// ---- `state help-json` (cli-output-spec §4) ----
+
+func cmd_help_json() {
+	h := "{"
+	h = h + "\"version\":\"" + version + "\","
+	h = h + "\"output\":\"json\","
+	h = h + "\"commands\":{"
+	h = h + "\"report\":{\"args\":[],\"flags\":[\"--json\",\"--no-interactive\",\"--yes\",\"--no-color\"],\"auth\":false},"
+	h = h + "\"config\":{\"args\":[\"[get|set|reset]\"],\"flags\":[\"--cpu-warn N\",\"--cpu-crit N\",\"--ram-warn N\",\"--ram-crit N\",\"--disk-warn N\",\"--disk-crit N\",\"--disk-path PATH\"],\"auth\":false},"
+	h = h + "\"guide\":{\"args\":[],\"flags\":[\"--human\"],\"auth\":false},"
+	h = h + "\"help-json\":{\"args\":[],\"flags\":[],\"auth\":false}"
+	h = h + "},"
+	h = h + "\"exit_codes\":{"
+	h = h + "\"0\":\"report: OK. other commands: success\","
+	h = h + "\"1\":\"report only: CAUTIOUS (nagios-style, not a cli-output-spec range)\","
+	h = h + "\"2\":\"report only: CRITICAL (nagios-style, not a cli-output-spec range)\","
+	h = h + "\"80\":\"invalid arguments / usage error\","
+	h = h + "\"85\":\"invalid argument value (bad threshold)\","
+	h = h + "\"92\":\"resource not found (disk path)\""
+	h = h + "},"
+	h = h + "\"env\":[\"HOME\"],"
+	h = h + "\"see_also\":[\"state guide\",\"state --help\"]"
+	h = h + "}"
+	println(h)
+}
+
+func print_help() {
+	println("state -- agent-first system health CLI (OK / CAUTIOUS / CRITICAL)")
+	println("")
+	println("usage: state [--json]")
+	println("       state config [get|set|reset] [flags]")
+	println("       state guide [--human]")
+	println("       state help-json")
+	println("       state --help")
+	println("")
+	println("options:")
+	println("  --json               machine-readable report (same data as the human report)")
+	println("  --help, -h           this help")
+	println("")
+	println("config set flags:")
+	println("  --cpu-warn N --cpu-crit N     load% thresholds (load1/cores*100), default 70/90")
+	println("  --ram-warn N --ram-crit N     memory used% thresholds, default 75/90")
+	println("  --disk-warn N --disk-crit N   disk used% thresholds, default 80/95")
+	println("  --disk-path PATH              filesystem path to check with df -h, default /")
+	println("")
+	println("exit codes: 0 OK, 1 CAUTIOUS, 2 CRITICAL (report only, nagios-style);")
+	println("            80-89 invalid input, 90-99 resource not found (other commands)")
+}
+
+func main() {
+	a := args()
+
+	if len(a) > 1 && a[1] == "config" {
+		cmd_config(a)
+		return
+	}
+	if len(a) > 1 && a[1] == "guide" {
+		cmd_guide(a)
+		exit(0)
+		return
+	}
+	if len(a) > 1 && (a[1] == "help-json" || a[1] == "--help-json") {
+		cmd_help_json()
+		exit(0)
+		return
+	}
+	if len(a) > 1 && (a[1] == "--help" || a[1] == "-h" || a[1] == "help") {
+		print_help()
+		exit(0)
+		return
+	}
+
+	want_json := false
+	i := 1
+	for i < len(a) {
+		arg := a[i]
+		if arg == "--json" { want_json = true }
+		// cli-output-spec §6: accepted no-ops (already non-interactive by default)
+		if arg == "--no-interactive" || arg == "--yes" || arg == "-y" || arg == "--no-color" {}
+		i = i + 1
+	}
+
+	c := load_config()
+	r := build_report(c)
+
+	if want_json {
+		println(report_json(r, c))
+	} else {
+		print(report_human(r))
+	}
+
+	exit(status_exit_code(r.status))
+}
